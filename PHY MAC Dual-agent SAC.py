@@ -215,6 +215,48 @@ class ConservativeTrainingConfig:
     w4: float = 0.8
     w5: float = 1.8
     beta: float = 22
+    
+class RealisticTrainingConfig:
+    """Realistic configuration with balanced parameters"""
+    # Core training parameters
+    buffer_size: int = 120000
+    batch_size: int = 256
+    gamma: float = 0.99
+    tau: float = 0.003
+    alpha: float = 0.2
+    lr: float = 2e-4
+    hidden_units: int = 384
+    max_neighbors: int = 15
+    
+    # Enhanced prioritized replay parameters
+    per_alpha: float = 0.7
+    per_beta: float = 0.5
+    per_beta_increment: float = 0.0005
+    per_eps: float = 1e-8
+    
+    # Balanced exploration parameters
+    initial_exploration_factor: float = 2.0
+    exploration_decay: float = 0.9998
+    min_exploration: float = 0.3
+    exploration_noise_scale: float = 0.6
+    action_noise_scale: float = 0.4
+    
+    # Conservative entropy settings
+    initial_log_std: float = 0.5
+    log_std_min: float = -10
+    log_std_max: float = 2
+    
+    # REALISTIC targets
+    cbr_target_base: float = 0.65
+    sinr_target_base: float = 12.0  # Realistic SINR target
+    
+    # BALANCED reward weights
+    w1: float = 5.0   # CBR weight
+    w2: float = 1.0   # Power penalty
+    w3: float = 3.0   # SINR weight
+    w4: float = 0.8   # MCS penalty
+    w5: float = 0.3   # Neighbor penalty (reduced)
+    beta: float = 2.0 # CBR sensitivity (much gentler)
 
 @dataclass
 class SystemConfig:
@@ -227,7 +269,7 @@ class SystemConfig:
     mcs_max: int = 9
     
     host: str = '127.0.0.1'
-    port: int = 5005
+    port: int = 5001
     log_dir: str = 'dual_agent_logs'
     model_save_dir: str = "saved_models"
     model_save_interval: int = 500  # Save every 500 requests instead of episodes
@@ -725,45 +767,47 @@ def set_seed(seed: int = 0):
         torch.cuda.manual_seed(seed)
 
 def get_adaptive_targets(neighbor_count: int) -> Dict[str, float]:
-    """Enhanced adaptive targets with more aggressive density adaptation"""
+    """Realistic adaptive targets with proper scaling"""
     density_factor = min(1.0, neighbor_count / training_config.max_neighbors)
     
     return {
-        # More aggressive adaptations
-        'CBR_TARGET': training_config.cbr_target_base * (1 - 0.5 * density_factor),  # Was 0.2
-        'SINR_TARGET': max(6.0, training_config.sinr_target_base - 8.0 * density_factor),  # Was 3.0
+        # CBR: 0.65 → 0.52 in high density
+        'CBR_TARGET': training_config.cbr_target_base * (1 - 0.2 * density_factor),
         
-        # New targets for MAC agent
-        'BEACON_TARGET': system_config.beacon_rate_max * (1 - 0.7 * density_factor),
-        'MCS_TARGET': system_config.mcs_max * (1 - 0.6 * density_factor),
+        # SINR: 12 → 9 in high density (realistic!)
+        'SINR_TARGET': max(8.0, training_config.sinr_target_base - 3.0 * density_factor),
         
-        # New targets for PHY agent
-        'POWER_TARGET': system_config.power_max * (1 - 0.5 * density_factor)
+        # MAC targets
+        'BEACON_TARGET': system_config.beacon_rate_max * (1 - 0.6 * density_factor),
+        'MCS_TARGET': system_config.mcs_max * (1 - 0.5 * density_factor),
+        
+        # PHY targets
+        'POWER_TARGET': system_config.power_max * (1 - 0.4 * density_factor)
     }
 
 
 def get_reward_weights(cbr: float, sinr: float) -> Dict[str, float]:
-    """Enhanced base reward weights with new parameters"""
+    """Improved base reward weights with balanced parameters"""
     w = {
         'W1': training_config.w1,      # CBR weight
         'W2': training_config.w2,      # Power weight  
         'W3': training_config.w3,      # SINR weight
-        'W4': training_config.w4,      # Legacy MCS weight
+        'W4': training_config.w4,      # MCS/Beacon weight
         'W5': training_config.w5,      # Neighbor weight
         'BETA': training_config.beta,  # CBR sharpness
         
-        # New weights for density adaptation
-        'W_BEACON': 1.0,      # Beacon control weight (will be adjusted by density)
-        'W_MCS': 1.0,         # MCS control weight (will be adjusted by density)
-        'W_INTERFERENCE': 1.0, # Interference penalty weight  
-        'W_COVERAGE': 0.8,    # Coverage bonus weight (PHY only)
+        # Additional weights for improved control
+        'W_BEACON': 1.0,       # Beacon control weight
+        'W_MCS': 1.0,          # MCS control weight
+        'W_INTERFERENCE': 1.0, # Interference penalty weight
+        'W_COVERAGE': 0.5,     # Coverage bonus weight
     }
     
-    # Dynamic adjustment based on current performance
-    if cbr < 0.2:
-        w['W1'] *= 1.5
-    if sinr < 10.0:
-        w['W3'] *= 1.5
+    # Dynamic adjustment based on performance (gentler than before)
+    if cbr < 0.4:  # Poor CBR
+        w['W1'] *= 1.3  # Slight increase in CBR focus
+    if sinr < 10.0:  # Poor SINR
+        w['W3'] *= 1.2  # Slight increase in SINR focus
         
     return w
 
@@ -1537,62 +1581,44 @@ class MACAgent(UltraExplorativeSACAgent):
     
     def calculate_reward(self, cbr: float, sinr: float, current_beacon: float, 
                         current_mcs: int, neighbor_count: int) -> float:
-        """Enhanced MAC reward with integrated density awareness"""
+        """IMPROVED MAC reward with distance-based CBR and realistic penalties"""
         try:
-            # Get density-aware targets
             targets = get_adaptive_targets(neighbor_count)
-            
-            # Get MAC-specific density-aware weights
-            weights = self.get_density_aware_weights(cbr, sinr, neighbor_count)
-            
+            weights = get_reward_weights(cbr, sinr)
             density_factor = min(1.0, neighbor_count / training_config.max_neighbors)
             
-            # 1. CBR Control (Primary MAC responsibility)
+            # 1. CBR Reward - Distance based (consistent approach from any direction)
             cbr_error = abs(cbr - targets['CBR_TARGET'])
-            cbr_term = weights['W1'] * (1 - math.tanh(weights['BETA'] * cbr_error))
+            if cbr_error < 0.03:  # Very close to target
+                cbr_reward = weights['W1'] * 2.0  # Bonus
+            else:
+                cbr_reward = weights['W1'] * max(0, 1 - cbr_error * 2.0)  # Linear penalty
             
-            # 2. Density-Aware Beacon Rate Control
+            # 2. Beacon Rate Control (density-aware)
             beacon_norm = (current_beacon - system_config.beacon_rate_min) / \
                          (system_config.beacon_rate_max - system_config.beacon_rate_min)
             
-            # High density → stronger beacon penalty, Low density → beacon reward
-            if density_factor > 0.6:
-                beacon_term = -weights['W_BEACON'] * density_factor * (beacon_norm ** 2)
-            else:
-                # Low density rewards higher beacon rates for coverage
-                beacon_term = weights['W_BEACON'] * (1 - density_factor) * beacon_norm
+            if density_factor > 0.6:  # High density - penalize high beacon rates
+                beacon_penalty = weights['W4'] * beacon_norm * density_factor
+            else:  # Low density - small reward for coverage
+                beacon_penalty = -weights['W4'] * 0.3 * beacon_norm
             
-            # 3. Density-Aware MCS Control  
+            # 3. MCS Control (density-aware)
             mcs_norm = current_mcs / system_config.mcs_max
             
-            if density_factor > 0.7:  # High density
-                # Prefer lower MCS for robustness (reward = 1 - mcs_norm)
-                mcs_term = weights['W_MCS'] * (1 - mcs_norm)
-                logger.debug(f"MAC High density: prefer low MCS, mcs_norm={mcs_norm:.2f}, reward={mcs_term:.3f}")
-                
-            elif density_factor < 0.3:  # Low density
-                # Prefer higher MCS for efficiency (reward = mcs_norm)  
-                mcs_term = weights['W_MCS'] * mcs_norm
-                logger.debug(f"MAC Low density: prefer high MCS, mcs_norm={mcs_norm:.2f}, reward={mcs_term:.3f}")
-                
-            else:  # Medium density - adaptive based on SINR
-                if sinr > targets['SINR_TARGET']:
-                    mcs_term = weights['W_MCS'] * mcs_norm  # Can afford higher MCS
-                else:
-                    mcs_term = weights['W_MCS'] * (1 - mcs_norm)  # Need robust MCS
-                logger.debug(f"MAC Medium density: SINR-adaptive MCS, sinr={sinr:.1f}, target={targets['SINR_TARGET']:.1f}")
+            if density_factor > 0.7:  # High density - prefer robust (low) MCS
+                mcs_reward = weights['W4'] * 0.5 * (1 - mcs_norm)
+            else:  # Low density - prefer efficient (high) MCS
+                mcs_reward = weights['W4'] * 0.5 * mcs_norm
             
-            # 4. Cooperation/Neighbor Impact
-            neighbor_penalty = weights['W5'] * math.log(1 + neighbor_count)
+            # 4. Cooperation bonus
+            if neighbor_count > 12:
+                cooperation_penalty = weights['W5'] * (neighbor_count - 12) * 0.1
+            else:
+                cooperation_penalty = 0
             
             # Final MAC reward
-            mac_reward = cbr_term + beacon_term + mcs_term - neighbor_penalty
-            
-            # Logging for debugging
-            if random.random() < 0.1:  # Log 10% of calculations
-                logger.debug(f"MAC Reward Breakdown (density={density_factor:.2f}):")
-                logger.debug(f"  CBR: {cbr_term:.3f}, Beacon: {beacon_term:.3f}, MCS: {mcs_term:.3f}, Neighbor: -{neighbor_penalty:.3f}")
-                logger.debug(f"  Total: {mac_reward:.3f}")
+            mac_reward = cbr_reward + mcs_reward - beacon_penalty - cooperation_penalty
             
             return float(mac_reward)
             
@@ -1636,54 +1662,40 @@ class PHYAgent(UltraExplorativeSACAgent):
         return base_weights
     
     def calculate_reward(self, cbr: float, sinr: float, current_power: float, 
-                        neighbor_count: int) -> float:
-        """Enhanced PHY reward with integrated density awareness"""
+                    neighbor_count: int) -> float:
+        """IMPROVED PHY reward using paper's tanh formula"""
         try:
-            # Get density-aware targets
             targets = get_adaptive_targets(neighbor_count)
-            
-            # Get PHY-specific density-aware weights  
-            weights = self.get_density_aware_weights(cbr, sinr, neighbor_count)
-            
+            weights = get_reward_weights(cbr, sinr)
             density_factor = min(1.0, neighbor_count / training_config.max_neighbors)
             
-            # 1. SINR Control (Primary PHY responsibility)
+            # 1. SINR Reward - Using paper's tanh formula (excellent design!)
             sinr_diff = sinr - targets['SINR_TARGET']
-            if abs(sinr_diff) < 2.0:
-                sinr_term = 0  # Good enough SINR
-            else:
-                sinr_term = weights['W3'] * math.tanh(sinr_diff / 5.0)
+            k = 5.0  # Sensitivity parameter from paper
+            sinr_reward = weights['W3'] * math.tanh(sinr_diff / k)
             
-            # 2. Density-Aware Power Control
+            # 2. Power Efficiency (quadratic penalty from paper)
             power_norm = (current_power - system_config.power_min) / \
                         (system_config.power_max - system_config.power_min)
             
-            # Progressive power penalty based on density
-            power_penalty_multiplier = 1.0 + (density_factor ** 2)  # Quadratic scaling
+            # Scale penalty by density (more penalty in high density)
+            power_penalty_multiplier = 1.0 + density_factor
             power_penalty = weights['W2'] * power_penalty_multiplier * (power_norm ** 2)
             
-            # 3. Interference Awareness (density-dependent)
-            interference_penalty = weights['W_INTERFERENCE'] * power_norm * density_factor
-            
-            # 4. Coverage vs Interference Trade-off
-            if density_factor < 0.3:  # Low density - reward coverage
-                coverage_bonus = weights['W_COVERAGE'] * power_norm * (1 - density_factor)
+            # 3. Coverage vs Interference trade-off
+            if density_factor < 0.4:  # Low density - reward coverage
+                coverage_bonus = weights['W2'] * 0.3 * power_norm * (1 - density_factor)
             else:
                 coverage_bonus = 0
             
-            # 5. Cooperation Incentive
-            cooperation_penalty = weights['W5'] * density_factor * power_norm
+            # 4. Cooperation incentive
+            if neighbor_count > 12:
+                cooperation_penalty = weights['W5'] * (neighbor_count - 12) * 0.05
+            else:
+                cooperation_penalty = 0
             
             # Final PHY reward
-            phy_reward = sinr_term - power_penalty - interference_penalty + coverage_bonus - cooperation_penalty
-            
-            # Logging for debugging
-            if random.random() < 0.1:  # Log 10% of calculations
-                logger.debug(f"PHY Reward Breakdown (density={density_factor:.2f}):")
-                logger.debug(f"  SINR: {sinr_term:.3f}, Power: -{power_penalty:.3f}, Interference: -{interference_penalty:.3f}")
-                if coverage_bonus > 0:
-                    logger.debug(f"  Coverage: +{coverage_bonus:.3f}")
-                logger.debug(f"  Cooperation: -{cooperation_penalty:.3f}, Total: {phy_reward:.3f}")
+            phy_reward = sinr_reward - power_penalty + coverage_bonus - cooperation_penalty
             
             return float(phy_reward)
             
@@ -1767,7 +1779,7 @@ class MaxExplorativeVehicleNode:
     
     def get_coordinated_actions(self, state: List[float], current_params: Dict[str, float]) -> Dict[str, Any]:
         """
-        CORRECTED: Get coordinated actions with proper agent responsibilities and comprehensive density adaptation
+        COMPLETE REPLACEMENT: Get coordinated actions with improved reward system
         
         Architecture:
         - MAC Agent: Controls beacon_rate + MCS (2 actions)
@@ -1810,7 +1822,7 @@ class MaxExplorativeVehicleNode:
             density_factor = min(1.0, neighbor_count / training_config.max_neighbors)
             
             # ================================
-            # 2. AGENT ACTION SELECTION (CORRECTED ARCHITECTURE)
+            # 2. AGENT ACTION SELECTION
             # ================================
             try:
                 # MAC Agent: Controls beacon_rate and MCS (2 actions)
@@ -1830,7 +1842,7 @@ class MaxExplorativeVehicleNode:
                 return self._get_safe_default_actions()
             
             # ================================
-            # 3. CORRECTED ACTION MAPPING
+            # 3. ACTION MAPPING
             # ================================
             # Extract actions with NaN protection
             try:
@@ -1869,9 +1881,9 @@ class MaxExplorativeVehicleNode:
             )
             
             # ================================
-            # 6. DENSITY-AWARE REWARD CALCULATION
+            # 6. IMPROVED UNIFIED REWARD CALCULATION
             # ================================
-            # Calculate individual agent rewards using their density-aware methods
+            # Use improved agent-specific reward calculations
             mac_reward = self.mac_agent.calculate_reward(
                 cbr=cbr,
                 sinr=snr, 
@@ -1887,12 +1899,36 @@ class MaxExplorativeVehicleNode:
                 neighbor_count=neighbor_count
             )
             
-            # Combined reward with MAC-heavy weighting (since MAC handles 2 parameters)
-            joint_reward = 0.65 * mac_reward + 0.35 * phy_reward
+            # Combined reward with amplified differentiation
+            joint_reward = 0.6 * mac_reward + 0.4 * phy_reward
+            
+            # AMPLIFY differences for better learning
+            joint_reward = joint_reward * 1.5
+            
+            # Add clear performance bonuses/penalties for better differentiation
+            targets = get_adaptive_targets(int(neighbor_count))
+            
+            # CBR performance bonus/penalty
+            cbr_error = abs(cbr - targets['CBR_TARGET'])
+            if cbr_error < 0.05:  # Excellent CBR
+                joint_reward += 3.0
+            elif cbr_error > 0.3:  # Poor CBR
+                joint_reward -= 2.0
+            
+            # SINR performance bonus/penalty
+            sinr_error = abs(snr - targets['SINR_TARGET'])
+            if sinr_error < 2.0:  # Excellent SINR
+                joint_reward += 2.0
+            elif sinr_error > 8.0:  # Poor SINR
+                joint_reward -= 2.0
+            
+            # High density cooperation bonus
+            if neighbor_count > 15 and cbr > 0.5 and snr > 10.0:
+                joint_reward += 1.5  # Reward good performance in challenging conditions
             
             # Add exploration bonus in training mode
             if self.training_mode and self.mac_agent.exploration_factor > 1.0:
-                exploration_bonus = 0.05 * (self.mac_agent.exploration_factor - 1.0)
+                exploration_bonus = 0.3 * (self.mac_agent.exploration_factor - 1.0)
                 joint_reward += exploration_bonus
             
             # ================================
@@ -1938,7 +1974,7 @@ class MaxExplorativeVehicleNode:
             # 11. PREPARE RESPONSE
             # ================================
             result = {
-                # CORRECTED: Proper agent responsibilities
+                # Agent responsibilities
                 'beacon_delta': beacon_delta,        # MAC Agent responsibility
                 'mcs_delta': mcs_delta,             # MAC Agent responsibility  
                 'power_delta': power_delta,         # PHY Agent responsibility
@@ -2919,7 +2955,7 @@ class SimplifiedDecentralizedRLServer:
             try:
                 state = [
                     float(vehicle_data.get('CBR', 0)),
-                    float(vehicle_data.get('SNR', 0)),
+                    float(vehicle_data.get('SINR', 0)),
                     float(vehicle_data.get('neighbors', 0))
                 ]
                 
@@ -2930,7 +2966,7 @@ class SimplifiedDecentralizedRLServer:
                 }
                 
                 logger.info(f"[VEHICLE {vehicle_id}] Input Data:")
-                logger.info(f"  State: CBR={state[0]:.3f}, SNR={state[1]:.1f}dB, Neighbors={int(state[2])}")
+                logger.info(f"  State: CBR={state[0]:.3f}, SINR={state[1]:.1f}dB, Neighbors={int(state[2])}")
                 logger.info(f"  Current: Power={current_params['transmissionPower']:.1f}dBm, Beacon={current_params['beaconRate']:.1f}Hz, MCS={current_params['MCS']}")
                 
                 # FIXED CENTRALIZED LEARNING: Initialize vehicle with shared agents for collective learning
@@ -3359,7 +3395,7 @@ if __name__ == "__main__":
             timeout_minutes=system_config.auto_save_timeout
         )
         
-        logger.info("Starting COMPLETE REVISED Dual-Agent SAC server...")
+        logger.info("Starting COMPLETE Dual-Agent SAC server...")
         logger.info("Press Ctrl+C to stop the server")
         logger.info("Server will respond to simulation requests until simulation naturally stops")
         
